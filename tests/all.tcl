@@ -9,6 +9,18 @@ package require tcltest 2
 namespace import ::tcltest::test
 ::tcltest::configure -verbose start
 ::tcltest::testConstraint x11 [expr {[tk windowingsystem] eq "x11"}]
+set permissionProbe [file join [::tcltest::temporaryDirectory] \
+    tklitehtml-permission-probe-[pid]]
+set permissionChannel [open $permissionProbe w]
+close $permissionChannel
+if {$::tcl_platform(platform) eq "unix"} {
+    file attributes $permissionProbe -permissions 0000
+}
+::tcltest::testConstraint filePermissions \
+    [expr {$::tcl_platform(platform) eq "unix" && \
+        ![file readable $permissionProbe]}]
+catch {file attributes $permissionProbe -permissions 0600}
+file delete -force $permissionProbe
 
 set packageIndex [lsearch -exact $argv -packagepath]
 if {$packageIndex < 0 || $packageIndex + 1 >= [llength $argv]} {
@@ -43,6 +55,30 @@ test widget-1.1 {widget options support configure and cget} -setup {
 } -cleanup {
     deleteWidget
 } -result {360 200 #f8f8f8}
+
+test widget-1.2 {resource limits are configurable and reject invalid values} -setup {
+    set widget [makeWidget -maxdocumentbytes 4096 \
+        -maximagepixels 2048 -maxviewportpixels 1048576]
+} -body {
+    list \
+        [$widget cget -maxdocumentbytes] \
+        [$widget cget -maximagepixels] \
+        [$widget cget -maxviewportpixels] \
+        [catch {$widget configure -maxdocumentbytes 0}]
+} -cleanup {
+    deleteWidget
+} -result {4096 2048 1048576 1}
+
+test widget-1.3 {constructor errors leave no partial widget command} -body {
+    set status [catch {
+        ::tklitehtml::widget .invalid -maxdocumentbytes 0
+    }]
+    list $status \
+        [winfo exists .invalid] \
+        [llength [info commands .invalid]]
+} -cleanup {
+    catch {destroy .invalid}
+} -result {1 0 0}
 
 test document-1.1 {load exposes rendered Unicode text and character ranges} -setup {
     set widget [makeWidget]
@@ -99,6 +135,18 @@ test document-1.4 {text extraction preserves visual word and line boundaries} -s
 } -cleanup {
     deleteWidget
 } -result {1 1}
+
+test document-1.5 {an oversized load preserves the current document} -setup {
+    set widget [makeWidget -maxdocumentbytes 128]
+    $widget load {<title>Original</title><p>Original text</p>}
+} -body {
+    set status [catch {$widget load [string repeat x 129]} message]
+    list $status [string match {*exceeds the 128 byte limit} $message] \
+        [$widget title] \
+        [expr {[string first {Original text} [$widget text]] >= 0}]
+} -cleanup {
+    deleteWidget
+} -result {1 1 Original 1}
 
 test search-1.1 {search option terminator permits a leading hyphen} -setup {
     set widget [makeWidget]
@@ -207,6 +255,192 @@ test resources-1.1 {resource callbacks supply images and imported stylesheets} -
     unset -nocomplain ::resourceCalls
 } -result {1 1}
 
+proc failingResource {widget kind url} {
+    error "fixture resource failure"
+}
+
+test resources-1.2 {a callback error preserves the current document} -setup {
+    set widget [makeWidget -resourcecommand failingResource]
+    $widget load {<title>Original</title><p>Original resource page</p>}
+} -body {
+    set status [catch {
+        $widget load {<link rel="stylesheet" href="bad.css"><p>Replacement</p>}
+    } message]
+    list $status \
+        [string match {*fixture resource failure*} $message] \
+        [$widget title] \
+        [expr {[string first {Original resource page} [$widget text]] >= 0}]
+} -cleanup {
+    deleteWidget
+} -result {1 1 Original 1}
+
+proc destroyingResource {widget kind url} {
+    destroy $widget
+    return {}
+}
+
+test resources-1.3 {destroying a widget from a resource callback is safe} -setup {
+    set widget [makeWidget -resourcecommand destroyingResource]
+} -body {
+    set status [catch {
+        $widget load {<link rel="stylesheet" href="destroy.css"><p>gone</p>}
+    } message]
+    list $status [string match {*destroyed*} $message] \
+        [winfo exists .html] \
+        [llength [info commands .html]]
+} -cleanup {
+    deleteWidget
+} -result {1 1 0 0}
+
+proc oversizedImageResource {widget kind url} {
+    if {$kind eq "image"} {
+        return ::oversizedImageFixture
+    }
+    return {}
+}
+
+test resources-1.4 {an oversized image is rejected transactionally} -setup {
+    image create photo ::oversizedImageFixture -width 20 -height 20
+    set widget [makeWidget -maximagepixels 100 \
+        -resourcecommand oversizedImageResource]
+    $widget load {<title>Original</title><p>Original image page</p>}
+} -body {
+    set status [catch {$widget load {<img src="large.png">}} message]
+    list $status [string match {*exceeds the 100 pixel limit} $message] \
+        [$widget title]
+} -cleanup {
+    deleteWidget
+    image delete ::oversizedImageFixture
+} -result {1 1 Original}
+
+test resources-1.5 {missing local resources do not destabilize rendering} -setup {
+    set widget [makeWidget]
+} -body {
+    set status [catch {
+        $widget load -baseurl /definitely/missing/index.html {
+            <link rel="stylesheet" href="missing.css">
+            <p>Readable text</p><img src="missing.png">
+        }
+    }]
+    list $status [expr {[string first {Readable text} [$widget text]] >= 0}]
+} -cleanup {
+    deleteWidget
+} -result {0 1}
+
+proc reentrantResource {widget kind url} {
+    $widget clear
+    return {}
+}
+
+test resources-1.6 {reentrant widget mutation is rejected transactionally} -setup {
+    set widget [makeWidget -resourcecommand reentrantResource]
+    $widget load {<title>Original</title><p>Original page</p>}
+} -body {
+    set status [catch {
+        $widget load {<link rel="stylesheet" href="recursive.css">}
+    } message]
+    list $status \
+        [string match {*unavailable during document loading*} $message] \
+        [$widget title]
+} -cleanup {
+    deleteWidget
+} -result {1 1 Original}
+
+test resources-1.7 {repeated image loads release internal Tk images} -setup {
+    set imagePath [file join [::tcltest::temporaryDirectory] \
+        tklitehtml-image-[pid].ppm]
+    image create photo ::imageFixture -width 4 -height 3
+    ::imageFixture put #336699 -to 0 0 4 3
+    ::imageFixture write $imagePath -format ppm
+    image delete ::imageFixture
+    set initialImages [lsort [image names]]
+} -body {
+    for {set iteration 0} {$iteration < 20} {incr iteration} {
+        set widget [makeWidget]
+        $widget load "<img src='[::tklitehtml::file_uri $imagePath]'>"
+        update
+        deleteWidget
+    }
+    expr {[lsort [image names]] eq $initialImages}
+} -cleanup {
+    deleteWidget
+    file delete -force $imagePath
+} -result 1
+
+test resources-1.8 {oversized local image files preserve the document} -setup {
+    set imagePath [file join [::tcltest::temporaryDirectory] \
+        tklitehtml-large-image-[pid].ppm]
+    image create photo ::largeImageFixture -width 20 -height 20
+    ::largeImageFixture put #336699 -to 0 0 20 20
+    ::largeImageFixture write $imagePath -format ppm
+    image delete ::largeImageFixture
+    set widget [makeWidget -maxdocumentbytes 128]
+    $widget load {<title>Original</title><p>Original page</p>}
+} -body {
+    set baseUrl [::tklitehtml::file_uri \
+        [file join [file dirname $imagePath] index.html]]
+    set imageName [file tail $imagePath]
+    set status [catch {
+        $widget load -baseurl $baseUrl "<img src='$imageName'>"
+    } message]
+    list $status \
+        [string match {*image resource exceeds*} $message] \
+        [$widget title]
+} -cleanup {
+    deleteWidget
+    file delete -force $imagePath
+} -result {1 1 Original}
+
+proc imageBudgetResource {widget kind url} {
+    if {$kind ne "image"} {
+        return {}
+    }
+    if {[string match {*first.png} $url]} {
+        return ::firstImageFixture
+    }
+    return ::secondImageFixture
+}
+
+test resources-1.9 {the decoded image budget applies to the document} -setup {
+    image create photo ::firstImageFixture -width 8 -height 8
+    image create photo ::secondImageFixture -width 8 -height 8
+    set widget [makeWidget -maximagepixels 100 \
+        -resourcecommand imageBudgetResource]
+    $widget load {<title>Original</title><p>Original page</p>}
+} -body {
+    set status [catch {
+        $widget load {<img src="first.png"><img src="second.png">}
+    } message]
+    list $status \
+        [string match {*exceeds the 100 pixel limit} $message] \
+        [$widget title]
+} -cleanup {
+    deleteWidget
+    image delete ::firstImageFixture ::secondImageFixture
+} -result {1 1 Original}
+
+proc oversizedStylesheet {widget kind url} {
+    if {$kind eq "stylesheet"} {
+        return [string repeat {p { color: #336699; }} 10]
+    }
+    return {}
+}
+
+test resources-1.10 {the byte budget includes imported stylesheets} -setup {
+    set widget [makeWidget -maxdocumentbytes 128 \
+        -resourcecommand oversizedStylesheet]
+    $widget load {<title>Original</title><p>Original page</p>}
+} -body {
+    set status [catch {
+        $widget load {<link rel="stylesheet" href="large.css">}
+    } message]
+    list $status \
+        [string match {*stylesheet exceeds*} $message] \
+        [$widget title]
+} -cleanup {
+    deleteWidget
+} -result {1 1 Original}
+
 proc recordLink {widget url attributes} {
     set ::clickedLink [list $widget $url $attributes]
 }
@@ -271,6 +505,128 @@ test browser-1.2 {file URI conversion preserves Unicode and reserved path charac
     set path [file normalize [file join [::tcltest::temporaryDirectory] {manual # é.html}]]
     expr {[::tklitehtml::local_path [::tklitehtml::file_uri $path]] eq $path}
 } -result 1
+
+test browser-1.3 {constructor errors leave no partial browser commands} -body {
+    set status [catch {
+        ::tklitehtml::browser .broken -maxdocumentbytes 0
+    }]
+    list $status \
+        [winfo exists .broken] \
+        [llength [info commands .broken]] \
+        [llength [info commands .broken.__hull]]
+} -cleanup {
+    catch {destroy .broken}
+} -result {1 0 0 0}
+
+test browser-1.4 {failed navigation preserves the current document} -setup {
+    set testDirectory [file normalize [file join \
+        [::tcltest::temporaryDirectory] browser-errors-[pid]]]
+    file mkdir $testDirectory
+    set firstPath [file join $testDirectory first.html]
+    set channel [open $firstPath w]
+    puts $channel {<title>First</title><p>First page</p>}
+    close $channel
+    set browser [::tklitehtml::browser .browser]
+    pack $browser -fill both -expand 1
+    $browser goto $firstPath
+} -body {
+    set originalLocation [$browser location]
+    set statuses {}
+    foreach target [list \
+        [file join $testDirectory missing.html] \
+        $testDirectory \
+        https://example.invalid/help.html] {
+        lappend statuses [catch {$browser goto $target}]
+    }
+    set errorVisible [expr {[$browser error] ne "" &&
+        [winfo manager .browser.error] eq "pack"}]
+    $browser goto $originalLocation
+    list $statuses \
+        [expr {[$browser location] eq $originalLocation}] \
+        [$browser title] \
+        $errorVisible \
+        [expr {[$browser error] eq ""}] \
+        [winfo manager .browser.error]
+} -cleanup {
+    catch {destroy .browser}
+    file delete -force $testDirectory
+} -result {{1 1 1} 1 First 1 1 {}}
+
+test browser-1.5 {failed back navigation retains its history entry} -setup {
+    set testDirectory [file normalize [file join \
+        [::tcltest::temporaryDirectory] browser-back-[pid]]]
+    file mkdir $testDirectory
+    set firstPath [file join $testDirectory first.html]
+    set secondPath [file join $testDirectory second.html]
+    foreach {path title} [list $firstPath First $secondPath Second] {
+        set channel [open $path w]
+        puts $channel "<title>$title</title><p>$title page</p>"
+        close $channel
+    }
+    set browser [::tklitehtml::browser .browser]
+    pack $browser -fill both -expand 1
+    $browser goto $firstPath
+    $browser goto $secondPath
+    file delete $firstPath
+} -body {
+    set firstFailure [catch {$browser back}]
+    set secondFailure [catch {$browser back}]
+    list $firstFailure $secondFailure [$browser title] \
+        [expr {[::tklitehtml::local_path [$browser location]] eq $secondPath}]
+} -cleanup {
+    catch {destroy .browser}
+    file delete -force $testDirectory
+} -result {1 1 Second 1}
+
+test browser-1.6 {file-size limits are enforced before reading} -setup {
+    set testDirectory [file normalize [file join \
+        [::tcltest::temporaryDirectory] browser-limit-[pid]]]
+    file mkdir $testDirectory
+    set firstPath [file join $testDirectory first.html]
+    set largePath [file join $testDirectory large.html]
+    set channel [open $firstPath w]
+    puts $channel {<title>First</title><p>First page</p>}
+    close $channel
+    set channel [open $largePath w]
+    puts -nonewline $channel [string repeat x 256]
+    close $channel
+    set browser [::tklitehtml::browser .browser \
+        -maxdocumentbytes 128]
+    pack $browser -fill both -expand 1
+    $browser goto $firstPath
+} -body {
+    set status [catch {$browser goto $largePath} message]
+    list $status \
+        [string match {*exceeds the 128 byte limit} $message] \
+        [$browser title]
+} -cleanup {
+    catch {destroy .browser}
+    file delete -force $testDirectory
+} -result {1 1 First}
+
+test browser-1.7 {unreadable files preserve browser state} -constraints filePermissions -setup {
+    set testDirectory [file normalize [file join \
+        [::tcltest::temporaryDirectory] browser-permissions-[pid]]]
+    file mkdir $testDirectory
+    set firstPath [file join $testDirectory first.html]
+    set unreadablePath [file join $testDirectory unreadable.html]
+    foreach path [list $firstPath $unreadablePath] {
+        set channel [open $path w]
+        puts $channel {<title>Fixture</title><p>Fixture page</p>}
+        close $channel
+    }
+    file attributes $unreadablePath -permissions 0000
+    set browser [::tklitehtml::browser .browser]
+    pack $browser -fill both -expand 1
+    $browser goto $firstPath
+} -body {
+    set status [catch {$browser goto $unreadablePath}]
+    list $status [$browser title]
+} -cleanup {
+    catch {file attributes $unreadablePath -permissions 0600}
+    catch {destroy .browser}
+    file delete -force $testDirectory
+} -result {1 Fixture}
 
 test errors-1.1 {invalid arity reports an error without destabilizing the widget} -setup {
     set widget [makeWidget]

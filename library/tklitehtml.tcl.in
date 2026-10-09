@@ -1,6 +1,7 @@
 namespace eval ::tklitehtml {
     # Win32 defines one wheel detent as WHEEL_DELTA=120.
     variable win32WheelDelta 120
+    variable browserReadChunkBytes 65536
     variable browserState
 }
 
@@ -129,24 +130,32 @@ proc ::tklitehtml::browser {path args} {
     set hullCommand ${path}.__hull
     rename $path $hullCommand
     interp alias {} $path {} ::tklitehtml::_browser_dispatch $path
-
-    scrollbar $path.vscroll -orient vertical -command [list $path.html yview]
-    scrollbar $path.hscroll -orient horizontal -command [list $path.html xview]
-    ::tklitehtml::widget $path.html {*}$widgetOptions \
-        -xscrollcommand [list $path.hscroll set] \
-        -yscrollcommand [list $path.vscroll set] \
-        -linkcommand [list ::tklitehtml::_browser_link $path]
-
-    pack $path.vscroll -side right -fill y
-    pack $path.hscroll -side bottom -fill x
-    pack $path.html -side left -fill both -expand true
-
     set browserState($path) [dict create \
         hull $hullCommand \
         history {} \
+        error {} \
         linkcommand $linkCommand \
         location {}]
     bind $path <Destroy> +[list ::tklitehtml::_browser_destroy $path %W]
+    try {
+        scrollbar $path.vscroll -orient vertical \
+            -command [list $path.html yview]
+        scrollbar $path.hscroll -orient horizontal \
+            -command [list $path.html xview]
+        label $path.error -anchor w -background #ffe8e8 \
+            -foreground #800000 -justify left
+        ::tklitehtml::widget $path.html {*}$widgetOptions \
+            -xscrollcommand [list $path.hscroll set] \
+            -yscrollcommand [list $path.vscroll set] \
+            -linkcommand [list ::tklitehtml::_browser_link $path]
+
+        pack $path.vscroll -side right -fill y
+        pack $path.hscroll -side bottom -fill x
+        pack $path.html -side left -fill both -expand true
+    } on error {message options} {
+        catch {destroy $path}
+        return -options $options $message
+    }
     return $path
 }
 
@@ -175,7 +184,8 @@ proc ::tklitehtml::_browser_dispatch {path method args} {
             if {[llength $args] != 0} {
                 error "wrong # args: should be \"$path back\""
             }
-            return [_browser_back $path]
+            return [_browser_attempt $path \
+                [list ::tklitehtml::_browser_back $path]]
         }
         cget {
             if {[llength $args] != 1} {
@@ -189,12 +199,23 @@ proc ::tklitehtml::_browser_dispatch {path method args} {
         configure {
             return [_browser_configure $path {*}$args]
         }
+        error {
+            if {[llength $args] == 0} {
+                return [dict get $browserState($path) error]
+            }
+            if {[llength $args] != 1} {
+                error "wrong # args: should be \"$path error ?message?\""
+            }
+            _browser_show_error $path [lindex $args 0]
+            return {}
+        }
         goto {
             if {[llength $args] < 1 || [llength $args] > 2 ||
                 ([llength $args] == 2 && [lindex $args 1] ne "-nosave")} {
                 error "wrong # args: should be \"$path goto location ?-nosave?\""
             }
-            return [_browser_goto $path [lindex $args 0] [expr {[llength $args] == 1}]]
+            return [_browser_attempt $path [list ::tklitehtml::_browser_goto \
+                $path [lindex $args 0] [expr {[llength $args] == 1}]]]
         }
         html {
             if {[llength $args] != 0} {
@@ -217,6 +238,61 @@ proc ::tklitehtml::_browser_dispatch {path method args} {
         default {
             return [$path.html $method {*}$args]
         }
+    }
+}
+
+proc ::tklitehtml::_browser_attempt {path command} {
+    try {
+        set result [uplevel #0 $command]
+    } on error {message options} {
+        _browser_show_error $path $message
+        return -options $options $message
+    }
+    _browser_show_error $path {}
+    return $result
+}
+
+proc ::tklitehtml::_browser_show_error {path message} {
+    variable browserState
+
+    if {![info exists browserState($path)]} {
+        return
+    }
+    dict set browserState($path) error $message
+    if {$message eq ""} {
+        pack forget $path.error
+        return
+    }
+    $path.error configure -text $message
+    if {[winfo manager $path.error] eq ""} {
+        pack $path.error -side top -fill x -before $path.html
+    }
+}
+
+proc ::tklitehtml::_browser_read_document {filePath maximumBytes} {
+    variable browserReadChunkBytes
+
+    set channel [open $filePath r]
+    try {
+        fconfigure $channel -encoding binary -translation binary
+        set bytes ""
+        while {true} {
+            set remaining [expr {$maximumBytes - [string length $bytes]}]
+            if {$remaining == 0} {
+                if {[read $channel 1] ne ""} {
+                    error "HTML document '$filePath' exceeds the $maximumBytes byte limit"
+                }
+                break
+            }
+            set readBytes [expr {min($remaining, $browserReadChunkBytes)}]
+            append bytes [read $channel $readBytes]
+            if {[eof $channel]} {
+                break
+            }
+        }
+        return [encoding convertfrom utf-8 $bytes]
+    } finally {
+        close $channel
     }
 }
 
@@ -291,19 +367,14 @@ proc ::tklitehtml::_browser_goto {path location saveHistory} {
     set oldLocation [dict get $browserState($path) location]
     set sameDocument [expr {$oldLocation ne "" && [local_path $oldLocation] eq $filePath}]
     if {!$sameDocument} {
-        if {![file readable $filePath] || [file isdirectory $filePath]} {
+        if {![file readable $filePath] || ![file isfile $filePath]} {
             error "cannot read HTML document '$filePath'"
         }
-        set channel [open $filePath r]
-        try {
-            fconfigure $channel -encoding utf-8
-            set html [read $channel]
-        } finally {
-            close $channel
+        set maximumBytes [$path.html cget -maxdocumentbytes]
+        if {[file size $filePath] > $maximumBytes} {
+            error "HTML document '$filePath' exceeds the $maximumBytes byte limit"
         }
-        if {$saveHistory && $oldLocation ne ""} {
-            dict lappend browserState($path) history $oldLocation
-        }
+        set html [_browser_read_document $filePath $maximumBytes]
         $path.html load -baseurl [file_uri $filePath] $html
     }
 
@@ -313,6 +384,9 @@ proc ::tklitehtml::_browser_goto {path location saveHistory} {
         $path.html fragment $fragment
     } elseif {$sameDocument} {
         $path.html yview moveto 0
+    }
+    if {!$sameDocument && $saveHistory && $oldLocation ne ""} {
+        dict lappend browserState($path) history $oldLocation
     }
     dict set browserState($path) location $newLocation
     return $newLocation
@@ -326,8 +400,9 @@ proc ::tklitehtml::_browser_back {path} {
         return {}
     }
     set location [lindex $history end]
+    set result [_browser_goto $path $location false]
     dict set browserState($path) history [lrange $history 0 end-1]
-    return [_browser_goto $path $location false]
+    return $result
 }
 
 proc ::tklitehtml::_browser_link {path widget url attributes} {

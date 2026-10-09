@@ -5,6 +5,7 @@
 #include <tk.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -12,11 +13,15 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <new>
+#include <numeric>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -41,6 +46,13 @@ constexpr char   kFileScheme[]       = "file://";
 constexpr char   kDefaultBackground[] = "white";
 constexpr char   kFindBackground[]    = "#fff29a";
 constexpr char   kCurrentBackground[] = "#ffbf69";
+constexpr std::size_t kDefaultMaxDocumentBytes = 16U * 1024U * 1024U;
+constexpr std::size_t kDefaultMaxImagePixels    = 16U * 1024U * 1024U;
+constexpr std::size_t kDefaultMaxViewportPixels = 16U * 1024U * 1024U;
+constexpr std::array<const char*, 10> kOptionNames = {
+    "-width",           "-height",         "-background",      "-maxdocumentbytes",
+    "-maximagepixels",  "-maxviewportpixels", "-xscrollcommand", "-yscrollcommand",
+    "-linkcommand",     "-resourcecommand"};
 
 enum PixelChannel
 {
@@ -55,7 +67,51 @@ constexpr unsigned int kColorComponentMaximum = 255U;
 
 int to_int(litehtml::pixel_t value)
 {
-    return static_cast<int>(std::lround(value.value()));
+    const double number = std::round(value.value());
+    if(!std::isfinite(number))
+    {
+        return 0;
+    }
+    return static_cast<int>(std::clamp(number, static_cast<double>(std::numeric_limits<int>::min()),
+                                       static_cast<double>(std::numeric_limits<int>::max())));
+}
+
+int exception_result(Tcl_Interp* interp, const char* operation)
+{
+    try
+    {
+        throw;
+    } catch(const std::bad_alloc&)
+    {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("%s failed: memory limit exceeded", operation));
+    } catch(const std::exception& error)
+    {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("%s failed: %s", operation, error.what()));
+    } catch(...)
+    {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("%s failed: unknown error", operation));
+    }
+    return TCL_ERROR;
+}
+
+bool dimensions_within_limit(int width, int height, std::size_t pixel_limit)
+{
+    if(width < 0 || height < 0)
+    {
+        return false;
+    }
+    if(width == 0 || height == 0)
+    {
+        return true;
+    }
+    return static_cast<std::size_t>(width) <= pixel_limit / static_cast<std::size_t>(height);
+}
+
+int saturating_add(int left, int right)
+{
+    const auto sum = static_cast<long long>(left) + right;
+    return static_cast<int>(std::clamp(sum, static_cast<long long>(std::numeric_limits<int>::min()),
+                                       static_cast<long long>(std::numeric_limits<int>::max())));
 }
 
 std::filesystem::path path_from_utf8(std::string_view path)
@@ -157,6 +213,11 @@ struct TextRun
     litehtml::web_color   color;
 };
 
+std::pair<int, int> text_run_location(const TextRun& run)
+{
+    return {to_int(run.position.x), to_int(run.position.y)};
+}
+
 struct Highlight
 {
     litehtml::web_color     background;
@@ -184,6 +245,7 @@ struct Image
     Tk_Image    handle   = nullptr;
     int         width    = 0;
     int         height   = 0;
+    std::size_t pixels   = 0;
     bool        internal = false;
 };
 
@@ -227,6 +289,7 @@ class HtmlWidget final : public litehtml::document_container
   private:
     static int  widget_command(ClientData client_data, Tcl_Interp* interp, int objc, Tcl_Obj* const objv[]);
     static void command_deleted(ClientData client_data);
+    static void free_widget(char* memory);
     static void event_handler(ClientData client_data, XEvent* event);
     static void redraw_idle(ClientData client_data);
     static void image_changed(ClientData client_data, int, int, int, int, int, int);
@@ -254,10 +317,13 @@ class HtmlWidget final : public litehtml::document_container
     void redraw();
     int  ensure_backing_image();
     void destroy_backing_image();
-    void resize_canvas();
+    int  resize_canvas();
     int  upload_canvas();
     void layout_document();
+    int  ensure_text_index();
     void build_text_index();
+    void invalidate_text_index();
+    bool has_active_highlights() const;
     void update_scroll_commands();
     void invoke_scroll_command(Tcl_Obj* command, int offset, int total, int viewport);
     void clamp_scroll();
@@ -288,6 +354,7 @@ class HtmlWidget final : public litehtml::document_container
     std::string resource(const char* kind, const std::string& url);
     Image*      image_for(const std::string& url);
     void        clear_images();
+    void        clear_images(std::map<std::string, Image>& images);
     void        delete_internal_image(const Image& image);
 
     void invoke_link(const std::string& url, const litehtml::element::ptr& element);
@@ -339,12 +406,17 @@ class HtmlWidget final : public litehtml::document_container
     Display*    display_ = nullptr;
     Tcl_Command command_token_ = nullptr;
 
-    int requested_width_  = kDefaultWidth;
-    int requested_height_ = kDefaultHeight;
-    int scroll_x_         = 0;
-    int scroll_y_         = 0;
-    int document_width_   = 0;
-    int document_height_  = 0;
+    int         requested_width_        = kDefaultWidth;
+    int         requested_height_       = kDefaultHeight;
+    int         scroll_x_               = 0;
+    int         scroll_y_               = 0;
+    int         document_width_         = 0;
+    int         document_height_        = 0;
+    std::size_t max_document_bytes_     = kDefaultMaxDocumentBytes;
+    std::size_t max_image_pixels_       = kDefaultMaxImagePixels;
+    std::size_t max_viewport_pixels_    = kDefaultMaxViewportPixels;
+    std::size_t document_resource_bytes_ = 0;
+    std::size_t image_pixels_            = 0;
 
     Tcl_Obj* xscroll_command_ = nullptr;
     Tcl_Obj* yscroll_command_ = nullptr;
@@ -359,11 +431,13 @@ class HtmlWidget final : public litehtml::document_container
     std::string plain_text_;
     std::string title_;
 
-    litehtml::document::ptr document_;
-    std::vector<TextRun>    text_runs_;
+    litehtml::document::ptr  document_;
+    std::vector<TextRun>     text_runs_;
+    std::vector<std::size_t> text_run_lookup_;
     std::map<std::string, Highlight> highlights_;
-    std::vector<TextRange> find_ranges_;
-    int                    current_find_ = -1;
+    std::vector<TextRange>  find_ranges_;
+    int                     current_find_         = -1;
+    int                     text_character_count_ = 0;
 
     std::map<std::uint32_t, TextColor> text_colors_;
     std::map<std::string, Image>     images_;
@@ -383,6 +457,8 @@ class HtmlWidget final : public litehtml::document_container
     bool redraw_pending_ = false;
     bool layout_pending_ = false;
     bool indexing_       = false;
+    bool text_index_valid_ = false;
+    bool loading_        = false;
     bool destroying_     = false;
 };
 
@@ -408,40 +484,70 @@ int HtmlWidget::create(Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
         return TCL_ERROR;
     }
 
-    auto widget = std::make_unique<HtmlWidget>(interp, window);
-    Tk_SetClass(window, "TkLiteHtml");
-    widget->background_ = Tk_GetColor(interp, window, Tk_GetUid(kDefaultBackground));
-    if(widget->background_ == nullptr)
+    try
+    {
+        auto widget = std::make_unique<HtmlWidget>(interp, window);
+        Tk_SetClass(window, "TkLiteHtml");
+        widget->background_ = Tk_GetColor(interp, window, Tk_GetUid(kDefaultBackground));
+        if(widget->background_ == nullptr)
+        {
+            Tk_DestroyWindow(window);
+            return TCL_ERROR;
+        }
+        Tk_SetWindowBackground(window, widget->background_->pixel);
+
+        if(widget->configure(objc - 2, objv + 2) != TCL_OK)
+        {
+            Tk_DestroyWindow(window);
+            return TCL_ERROR;
+        }
+
+        Tk_CreateEventHandler(
+            window,
+            ExposureMask | StructureNotifyMask | PointerMotionMask | LeaveWindowMask | ButtonPressMask |
+                ButtonReleaseMask,
+            event_handler, widget.get());
+        widget->command_token_ =
+            Tcl_CreateObjCommand(interp, Tk_PathName(window), widget_command, widget.get(), command_deleted);
+        Tk_GeometryRequest(window, widget->requested_width_, widget->requested_height_);
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(Tk_PathName(window), -1));
+        widget.release();
+        return TCL_OK;
+    } catch(...)
     {
         Tk_DestroyWindow(window);
-        return TCL_ERROR;
+        return exception_result(interp, "widget creation");
     }
-    Tk_SetWindowBackground(window, widget->background_->pixel);
-
-    if(widget->configure(objc - 2, objv + 2) != TCL_OK)
-    {
-        Tk_DestroyWindow(window);
-        return TCL_ERROR;
-    }
-
-    Tk_CreateEventHandler(window,
-                          ExposureMask | StructureNotifyMask | PointerMotionMask | LeaveWindowMask | ButtonPressMask |
-                              ButtonReleaseMask,
-                          event_handler, widget.get());
-    widget->command_token_ =
-        Tcl_CreateObjCommand(interp, Tk_PathName(window), widget_command, widget.get(), command_deleted);
-    Tk_GeometryRequest(window, widget->requested_width_, widget->requested_height_);
-    Tcl_SetObjResult(interp, Tcl_NewStringObj(Tk_PathName(window), -1));
-    widget.release();
-    return TCL_OK;
 }
 
-int HtmlWidget::widget_command(ClientData client_data, Tcl_Interp*, int objc, Tcl_Obj* const objv[])
+int HtmlWidget::widget_command(ClientData client_data, Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
 {
     auto* widget = static_cast<HtmlWidget*>(client_data);
     Tcl_Preserve(widget);
-    const int result = widget->command(objc, objv);
+    int result = TCL_ERROR;
+    try
+    {
+        result = widget->command(objc, objv);
+    } catch(...)
+    {
+        result = exception_result(widget->interp_, "widget command");
+    }
+    Tcl_Obj* error_result = nullptr;
+    if(result == TCL_ERROR)
+    {
+        if(Tcl_GetCharLength(Tcl_GetObjResult(interp)) == 0)
+        {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("widget command failed after the widget was destroyed", -1));
+        }
+        error_result = Tcl_GetObjResult(interp);
+        Tcl_IncrRefCount(error_result);
+    }
     Tcl_Release(widget);
+    if(error_result != nullptr)
+    {
+        Tcl_SetObjResult(interp, error_result);
+        Tcl_DecrRefCount(error_result);
+    }
     return result;
 }
 
@@ -454,29 +560,79 @@ void HtmlWidget::command_deleted(ClientData client_data)
         widget->destroying_ = true;
         Tk_DestroyWindow(widget->window_);
     }
-    delete widget;
+    Tcl_EventuallyFree(widget, free_widget);
+}
+
+void HtmlWidget::free_widget(char* memory)
+{
+    delete reinterpret_cast<HtmlWidget*>(memory);
 }
 
 void HtmlWidget::event_handler(ClientData client_data, XEvent* event)
 {
-    static_cast<HtmlWidget*>(client_data)->handle_event(event);
+    auto* widget = static_cast<HtmlWidget*>(client_data);
+    Tcl_Preserve(widget);
+    try
+    {
+        widget->handle_event(event);
+    } catch(...)
+    {
+        exception_result(widget->interp_, "widget event");
+        Tcl_BackgroundException(widget->interp_, TCL_ERROR);
+    }
+    Tcl_Release(widget);
 }
 
 void HtmlWidget::redraw_idle(ClientData client_data)
 {
     auto* widget = static_cast<HtmlWidget*>(client_data);
-    widget->redraw_pending_ = false;
-    widget->redraw();
+    Tcl_Preserve(widget);
+    try
+    {
+        widget->redraw_pending_ = false;
+        widget->redraw();
+    } catch(...)
+    {
+        exception_result(widget->interp_, "widget redraw");
+        Tcl_BackgroundException(widget->interp_, TCL_ERROR);
+    }
+    Tcl_Release(widget);
 }
 
 void HtmlWidget::image_changed(ClientData client_data, int, int, int, int, int, int)
 {
     auto* widget = static_cast<HtmlWidget*>(client_data);
-    for(auto& [url, image] : widget->images_)
+    Tcl_Preserve(widget);
+    try
     {
-        Tk_SizeOfImage(image.handle, &image.width, &image.height);
+        for(auto& [url, image] : widget->images_)
+        {
+            const std::size_t other_pixels = widget->image_pixels_ - image.pixels;
+            Tk_SizeOfImage(image.handle, &image.width, &image.height);
+            if(!dimensions_within_limit(image.width, image.height,
+                                        widget->max_image_pixels_ - other_pixels))
+            {
+                image.width = 0;
+                image.height = 0;
+                image.pixels = 0;
+                widget->image_pixels_ = other_pixels;
+                const std::string message = "image '" + url + "' exceeds the " +
+                    std::to_string(widget->max_image_pixels_) + " pixel limit";
+                Tcl_SetObjResult(widget->interp_, Tcl_NewStringObj(message.c_str(), -1));
+                Tcl_BackgroundException(widget->interp_, TCL_ERROR);
+            } else
+            {
+                image.pixels = static_cast<std::size_t>(image.width) * image.height;
+                widget->image_pixels_ = other_pixels + image.pixels;
+            }
+        }
+        widget->schedule_redraw(true);
+    } catch(...)
+    {
+        exception_result(widget->interp_, "image update");
+        Tcl_BackgroundException(widget->interp_, TCL_ERROR);
     }
-    widget->schedule_redraw(true);
+    Tcl_Release(widget);
 }
 
 void HtmlWidget::backing_image_changed(ClientData, int, int, int, int, int, int) {}
@@ -514,6 +670,11 @@ int HtmlWidget::command(int objc, Tcl_Obj* const objv[])
     {
         return TCL_ERROR;
     }
+    if(loading_ && static_cast<Command>(index) != Cget)
+    {
+        Tcl_SetObjResult(interp_, Tcl_NewStringObj("widget command is unavailable during document loading", -1));
+        return TCL_ERROR;
+    }
 
     switch(static_cast<Command>(index))
     {
@@ -539,12 +700,12 @@ int HtmlWidget::command(int objc, Tcl_Obj* const objv[])
         }
         document_.reset();
         html_source_.clear();
-        plain_text_.clear();
         title_.clear();
-        text_runs_.clear();
+        invalidate_text_index();
         find_ranges_.clear();
         current_find_ = -1;
         document_width_ = document_height_ = scroll_x_ = scroll_y_ = 0;
+        document_resource_bytes_ = 0;
         clear_images();
         for(auto& [name, highlight] : highlights_)
         {
@@ -590,6 +751,10 @@ int HtmlWidget::command(int objc, Tcl_Obj* const objv[])
         if(objc != 2)
         {
             Tcl_WrongNumArgs(interp_, 2, objv, nullptr);
+            return TCL_ERROR;
+        }
+        if(ensure_text_index() != TCL_OK)
+        {
             return TCL_ERROR;
         }
         Tcl_SetObjResult(interp_, Tcl_NewStringObj(plain_text_.data(), static_cast<int>(plain_text_.size())));
@@ -665,6 +830,36 @@ int HtmlWidget::set_option(Tcl_Obj* option, Tcl_Obj* value)
         Tk_SetWindowBackground(window_, background_->pixel);
         return TCL_OK;
     }
+    if(name == "-maxdocumentbytes" || name == "-maximagepixels" || name == "-maxviewportpixels")
+    {
+        Tcl_WideInt limit = 0;
+        if(Tcl_GetWideIntFromObj(interp_, value, &limit) != TCL_OK)
+        {
+            return TCL_ERROR;
+        }
+        const auto maximum = name == "-maxdocumentbytes" ?
+            static_cast<unsigned long long>(std::numeric_limits<int>::max()) :
+            static_cast<unsigned long long>(std::numeric_limits<std::size_t>::max());
+        if(limit <= 0 || static_cast<unsigned long long>(limit) > maximum)
+        {
+            const std::string message = name + " must be between 1 and " + std::to_string(maximum);
+            Tcl_SetObjResult(interp_, Tcl_NewStringObj(message.c_str(), -1));
+            return TCL_ERROR;
+        }
+        const auto value = static_cast<std::size_t>(limit);
+        const auto viewport_pixels = static_cast<std::size_t>(canvas_width_) * canvas_height_;
+        if((name == "-maxdocumentbytes" && value < document_resource_bytes_) ||
+           (name == "-maximagepixels" && value < image_pixels_) ||
+           (name == "-maxviewportpixels" && value < viewport_pixels))
+        {
+            Tcl_SetObjResult(interp_, Tcl_ObjPrintf("%s is smaller than the current document", name.c_str()));
+            return TCL_ERROR;
+        }
+        auto& destination = name == "-maxdocumentbytes" ? max_document_bytes_ :
+            name == "-maximagepixels" ? max_image_pixels_ : max_viewport_pixels_;
+        destination = value;
+        return TCL_OK;
+    }
     if(name == "-xscrollcommand")
     {
         replace_obj(xscroll_command_, value);
@@ -703,6 +898,18 @@ Tcl_Obj* HtmlWidget::option_value(std::string_view option) const
     {
         return Tcl_NewStringObj(background_ != nullptr ? Tk_NameOfColor(background_) : "", -1);
     }
+    if(option == "-maxdocumentbytes")
+    {
+        return Tcl_NewWideIntObj(static_cast<Tcl_WideInt>(max_document_bytes_));
+    }
+    if(option == "-maximagepixels")
+    {
+        return Tcl_NewWideIntObj(static_cast<Tcl_WideInt>(max_image_pixels_));
+    }
+    if(option == "-maxviewportpixels")
+    {
+        return Tcl_NewWideIntObj(static_cast<Tcl_WideInt>(max_viewport_pixels_));
+    }
     Tcl_Obj* object = nullptr;
     if(option == "-xscrollcommand")
     {
@@ -722,10 +929,8 @@ Tcl_Obj* HtmlWidget::option_value(std::string_view option) const
 
 Tcl_Obj* HtmlWidget::configuration_info() const
 {
-    static const char* const names[] = {"-width", "-height", "-background", "-xscrollcommand",
-                                        "-yscrollcommand", "-linkcommand", "-resourcecommand"};
     Tcl_Obj* result = Tcl_NewListObj(0, nullptr);
-    for(const char* name : names)
+    for(const char* name : kOptionNames)
     {
         Tcl_Obj* pair[2] = {Tcl_NewStringObj(name, -1), option_value(name)};
         Tcl_ListObjAppendElement(interp_, result, Tcl_NewListObj(2, pair));
@@ -736,9 +941,10 @@ Tcl_Obj* HtmlWidget::configuration_info() const
 int HtmlWidget::cget(Tcl_Obj* option)
 {
     const std::string name = Tcl_GetString(option);
-    static const std::vector<std::string> names = {"-width", "-height", "-background", "-xscrollcommand",
-                                                   "-yscrollcommand", "-linkcommand", "-resourcecommand"};
-    if(std::find(names.begin(), names.end(), name) == names.end())
+    const auto known = std::find_if(kOptionNames.begin(), kOptionNames.end(), [&name](const char* option_name) {
+        return name == option_name;
+    });
+    if(known == kOptionNames.end())
     {
         Tcl_SetObjResult(interp_, Tcl_ObjPrintf("unknown option \"%s\"", name.c_str()));
         return TCL_ERROR;
@@ -787,27 +993,93 @@ int HtmlWidget::load_document(int objc, Tcl_Obj* const objv[])
 
     int         length = 0;
     const char* bytes  = Tcl_GetStringFromObj(objv[index], &length);
-    html_source_.assign(bytes, static_cast<std::size_t>(length));
-    base_url_          = std::move(base);
-    document_base_url_ = base_url_;
-    user_stylesheet_   = std::move(style);
-    title_.clear();
-    clear_images();
+    const auto source_size = static_cast<std::size_t>(length);
+    if(source_size > max_document_bytes_ || style.size() > max_document_bytes_ - source_size)
+    {
+        const std::string message = "HTML document exceeds the " + std::to_string(max_document_bytes_) +
+            " byte limit";
+        Tcl_SetObjResult(interp_, Tcl_NewStringObj(message.c_str(), -1));
+        return TCL_ERROR;
+    }
+    auto previous_document = std::move(document_);
+    auto previous_images = std::move(images_);
+    auto previous_text_runs = std::move(text_runs_);
+    auto previous_text_run_lookup = std::move(text_run_lookup_);
+    auto previous_plain_text = std::move(plain_text_);
+    auto previous_html_source = std::move(html_source_);
+    auto previous_base_url = std::move(base_url_);
+    auto previous_document_base_url = std::move(document_base_url_);
+    auto previous_user_stylesheet = std::move(user_stylesheet_);
+    auto previous_title = std::move(title_);
+    const std::size_t previous_document_resource_bytes = document_resource_bytes_;
+    const std::size_t previous_image_pixels = image_pixels_;
+    const int previous_text_character_count = text_character_count_;
+    const int previous_document_width = document_width_;
+    const int previous_document_height = document_height_;
+    const int previous_scroll_x = scroll_x_;
+    const int previous_scroll_y = scroll_y_;
+    const bool previous_text_index_valid = text_index_valid_;
+
+    const auto restore_previous_document = [&]() {
+        document_.reset();
+        clear_images();
+        document_ = std::move(previous_document);
+        images_ = std::move(previous_images);
+        text_runs_ = std::move(previous_text_runs);
+        text_run_lookup_ = std::move(previous_text_run_lookup);
+        plain_text_ = std::move(previous_plain_text);
+        html_source_ = std::move(previous_html_source);
+        base_url_ = std::move(previous_base_url);
+        document_base_url_ = std::move(previous_document_base_url);
+        user_stylesheet_ = std::move(previous_user_stylesheet);
+        title_ = std::move(previous_title);
+        document_resource_bytes_ = previous_document_resource_bytes;
+        image_pixels_ = previous_image_pixels;
+        text_character_count_ = previous_text_character_count;
+        document_width_ = previous_document_width;
+        document_height_ = previous_document_height;
+        scroll_x_ = previous_scroll_x;
+        scroll_y_ = previous_scroll_y;
+        text_index_valid_ = previous_text_index_valid;
+    };
+
+    loading_ = true;
+    try
+    {
+        html_source_.assign(bytes, source_size);
+        base_url_ = std::move(base);
+        document_base_url_ = base_url_;
+        user_stylesheet_ = std::move(style);
+        document_resource_bytes_ = source_size + user_stylesheet_.size();
+        image_pixels_ = 0;
+        title_.clear();
+        scroll_x_ = 0;
+        scroll_y_ = 0;
+        invalidate_text_index();
+        document_ = litehtml::document::createFromString(html_source_.c_str(), this, litehtml::master_css,
+                                                         user_stylesheet_);
+        if(document_ == nullptr || window_ == nullptr)
+        {
+            throw std::runtime_error("HTML parser did not produce a document");
+        }
+        layout_document();
+        if(window_ == nullptr)
+        {
+            throw std::runtime_error("widget was destroyed while loading the document");
+        }
+    } catch(...)
+    {
+        loading_ = false;
+        restore_previous_document();
+        return exception_result(interp_, "document load");
+    }
+    loading_ = false;
+    previous_document.reset();
+    clear_images(previous_images);
     clear_highlights();
     find_ranges_.clear();
     current_find_ = -1;
-
-    try
-    {
-        document_ = litehtml::document::createFromString(html_source_.c_str(), this, litehtml::master_css,
-                                                         user_stylesheet_);
-    } catch(const std::exception& error)
-    {
-        document_.reset();
-        Tcl_SetObjResult(interp_, Tcl_ObjPrintf("unable to parse HTML: %s", error.what()));
-        return TCL_ERROR;
-    }
-    layout_document();
+    update_scroll_commands();
     schedule_redraw();
     return TCL_OK;
 }
@@ -905,7 +1177,16 @@ void HtmlWidget::redraw()
         return;
     }
 
-    resize_canvas();
+    if(resize_canvas() != TCL_OK)
+    {
+        Tcl_BackgroundException(interp_, TCL_ERROR);
+        return;
+    }
+    if(has_active_highlights() && ensure_text_index() != TCL_OK)
+    {
+        Tcl_BackgroundException(interp_, TCL_ERROR);
+        return;
+    }
     reset_clip();
     paint_text_.clear();
     const litehtml::web_color background(static_cast<litehtml::byte>(background_->red >> 8),
@@ -989,11 +1270,21 @@ void HtmlWidget::destroy_backing_image()
     backing_image_name_.clear();
 }
 
-void HtmlWidget::resize_canvas()
+int HtmlWidget::resize_canvas()
 {
     canvas_width_  = std::max(Tk_Width(window_), 1);
     canvas_height_ = std::max(Tk_Height(window_), 1);
-    pixels_.assign(static_cast<std::size_t>(canvas_width_) * canvas_height_ * PixelChannelCount, 0);
+    const auto width = static_cast<std::size_t>(canvas_width_);
+    const auto height = static_cast<std::size_t>(canvas_height_);
+    if(width > max_viewport_pixels_ / height)
+    {
+        const std::string message = "widget viewport exceeds the " + std::to_string(max_viewport_pixels_) +
+            " pixel limit";
+        Tcl_SetObjResult(interp_, Tcl_NewStringObj(message.c_str(), -1));
+        return TCL_ERROR;
+    }
+    pixels_.assign(width * height * PixelChannelCount, 0);
+    return TCL_OK;
 }
 
 int HtmlWidget::upload_canvas()
@@ -1023,22 +1314,73 @@ void HtmlWidget::layout_document()
     document_width_  = std::max(to_int(document_->width()), width);
     document_height_ = std::max(to_int(document_->height()), Tk_Height(window_));
     clamp_scroll();
-    build_text_index();
-    update_scroll_commands();
+    invalidate_text_index();
+    if(!loading_)
+    {
+        update_scroll_commands();
+    }
+}
+
+int HtmlWidget::ensure_text_index()
+{
+    if(text_index_valid_ || document_ == nullptr)
+    {
+        return TCL_OK;
+    }
+    try
+    {
+        build_text_index();
+    } catch(...)
+    {
+        invalidate_text_index();
+        return exception_result(interp_, "text indexing");
+    }
+    return TCL_OK;
 }
 
 void HtmlWidget::build_text_index()
 {
     text_runs_.clear();
     plain_text_.clear();
+    text_character_count_ = 0;
     if(document_ == nullptr)
     {
+        text_index_valid_ = true;
         return;
     }
     indexing_ = true;
-    litehtml::position clip(0, 0, std::max(document_width_, 1), std::max(document_height_, 1));
-    document_->draw(0, 0, 0, &clip);
-    indexing_ = false;
+    try
+    {
+        litehtml::position clip(0, 0, std::max(document_width_, 1), std::max(document_height_, 1));
+        document_->draw(0, 0, 0, &clip);
+        indexing_ = false;
+        text_run_lookup_.resize(text_runs_.size());
+        std::iota(text_run_lookup_.begin(), text_run_lookup_.end(), 0);
+        std::sort(text_run_lookup_.begin(), text_run_lookup_.end(), [this](std::size_t left, std::size_t right) {
+            return text_run_location(text_runs_[left]) < text_run_location(text_runs_[right]);
+        });
+        text_index_valid_ = true;
+    } catch(...)
+    {
+        indexing_ = false;
+        throw;
+    }
+}
+
+void HtmlWidget::invalidate_text_index()
+{
+    text_runs_.clear();
+    text_run_lookup_.clear();
+    plain_text_.clear();
+    text_character_count_ = 0;
+    text_index_valid_ = false;
+}
+
+bool HtmlWidget::has_active_highlights() const
+{
+    return std::any_of(highlights_.begin(), highlights_.end(), [](const auto& item) {
+        return !item.second.ranges.empty();
+    });
 }
 
 void HtmlWidget::clamp_scroll()
@@ -1163,16 +1505,17 @@ std::vector<TextRange> HtmlWidget::search(std::string_view pattern, bool no_case
         std::transform(haystack.begin(), haystack.end(), haystack.begin(), Tcl_UniCharToLower);
         std::transform(needle.begin(), needle.end(), needle.begin(), Tcl_UniCharToLower);
     }
-    for(std::size_t start = 0; start + needle.size() <= haystack.size();)
+    const auto searcher = std::boyer_moore_searcher(needle.begin(), needle.end());
+    for(auto start = haystack.begin(); start != haystack.end();)
     {
-        if(std::equal(needle.begin(), needle.end(), haystack.begin() + static_cast<std::ptrdiff_t>(start)))
+        const auto found = std::search(start, haystack.end(), searcher);
+        if(found == haystack.end())
         {
-            matches.push_back({static_cast<int>(start), static_cast<int>(start + needle.size())});
-            start += needle.size();
-        } else
-        {
-            ++start;
+            break;
         }
+        const auto first = static_cast<int>(std::distance(haystack.begin(), found));
+        matches.push_back({first, first + static_cast<int>(needle.size())});
+        start = found + static_cast<std::ptrdiff_t>(needle.size());
     }
     return matches;
 }
@@ -1209,6 +1552,10 @@ int HtmlWidget::search_command(int objc, Tcl_Obj* const objv[])
     {
         return wrong_args("search ?-all? ?-nocase? ?--? pattern");
     }
+    if(ensure_text_index() != TCL_OK)
+    {
+        return TCL_ERROR;
+    }
     return ranges_result(search(Tcl_GetString(objv[index]), no_case), all);
 }
 
@@ -1240,7 +1587,7 @@ int HtmlWidget::parse_ranges(Tcl_Obj* object, std::vector<TextRange>& ranges) co
     {
         return TCL_ERROR;
     }
-    const int text_length = Tcl_NumUtfChars(plain_text_.data(), static_cast<int>(plain_text_.size()));
+    const int text_length = text_character_count_;
     for(int index = 0; index < count; ++index)
     {
         Tcl_Obj* pair = nullptr;
@@ -1269,6 +1616,26 @@ int HtmlWidget::parse_ranges(Tcl_Obj* object, std::vector<TextRange>& ranges) co
         }
         ranges.push_back({first, last});
     }
+    std::sort(ranges.begin(), ranges.end(), [](const TextRange& left, const TextRange& right) {
+        return left.first < right.first || (left.first == right.first && left.last < right.last);
+    });
+    std::vector<TextRange> normalized;
+    normalized.reserve(ranges.size());
+    for(const auto& range : ranges)
+    {
+        if(range.first == range.last)
+        {
+            continue;
+        }
+        if(normalized.empty() || range.first > normalized.back().last)
+        {
+            normalized.push_back(range);
+        } else
+        {
+            normalized.back().last = std::max(normalized.back().last, range.last);
+        }
+    }
+    ranges = std::move(normalized);
     return TCL_OK;
 }
 
@@ -1350,6 +1717,10 @@ int HtmlWidget::highlight_command(int objc, Tcl_Obj* const objv[])
     {
         return wrong_args("highlight set name ranges");
     }
+    if(ensure_text_index() != TCL_OK)
+    {
+        return TCL_ERROR;
+    }
     std::vector<TextRange> ranges;
     if(parse_ranges(objv[2], ranges) != TCL_OK)
     {
@@ -1384,6 +1755,10 @@ int HtmlWidget::find_command(int objc, Tcl_Obj* const objv[])
         ensure_highlight("find-current").ranges.clear();
         schedule_redraw();
         return TCL_OK;
+    }
+    if(ensure_text_index() != TCL_OK)
+    {
+        return TCL_ERROR;
     }
     if(command == 4)
     {
@@ -1455,7 +1830,7 @@ const TextRun* HtmlWidget::run_at(int index) const
 int HtmlWidget::index_from_obj(Tcl_Obj* object, int& index) const
 {
     const std::string value = Tcl_GetString(object);
-    const int text_length = Tcl_NumUtfChars(plain_text_.data(), static_cast<int>(plain_text_.size()));
+    const int text_length = text_character_count_;
     if(value == "end")
     {
         index = text_length;
@@ -1475,6 +1850,10 @@ int HtmlWidget::index_from_obj(Tcl_Obj* object, int& index) const
 
 int HtmlWidget::bbox_command(Tcl_Obj* index_obj)
 {
+    if(ensure_text_index() != TCL_OK)
+    {
+        return TCL_ERROR;
+    }
     int index = 0;
     if(index_from_obj(index_obj, index) != TCL_OK)
     {
@@ -1500,6 +1879,10 @@ int HtmlWidget::bbox_command(Tcl_Obj* index_obj)
 
 int HtmlWidget::see_command(Tcl_Obj* index_obj)
 {
+    if(ensure_text_index() != TCL_OK)
+    {
+        return TCL_ERROR;
+    }
     int index = 0;
     if(index_from_obj(index_obj, index) != TCL_OK)
     {
@@ -1526,10 +1909,14 @@ void HtmlWidget::paint_highlights(const TextRun& run, int screen_x, int screen_y
 {
     for(const auto& [name, highlight] : highlights_)
     {
-        for(const auto& range : highlight.ranges)
+        auto range = std::lower_bound(highlight.ranges.begin(), highlight.ranges.end(), run.range.first,
+                                      [](const TextRange& candidate, int first) {
+                                          return candidate.last <= first;
+                                      });
+        for(; range != highlight.ranges.end() && range->first < run.range.last; ++range)
         {
-            const int first = std::max(range.first, run.range.first);
-            const int last  = std::min(range.last, run.range.last);
+            const int first = std::max(range->first, run.range.first);
+            const int last  = std::min(range->last, run.range.last);
             if(first >= last)
             {
                 continue;
@@ -1623,11 +2010,15 @@ void HtmlWidget::blend_pixel(int x, int y, const litehtml::web_color& color)
 
 void HtmlWidget::fill_rectangle(const litehtml::web_color& color, int x, int y, int width, int height)
 {
+    if(width <= 0 || height <= 0)
+    {
+        return;
+    }
     const auto clip = active_clip();
     const int left   = std::max(x, to_int(clip.left()));
     const int top    = std::max(y, to_int(clip.top()));
-    const int right  = std::min(x + width, to_int(clip.right()));
-    const int bottom = std::min(y + height, to_int(clip.bottom()));
+    const int right  = std::min(saturating_add(x, width), to_int(clip.right()));
+    const int bottom = std::min(saturating_add(y, height), to_int(clip.bottom()));
     for(int row = top; row < bottom; ++row)
     {
         for(int column = left; column < right; ++column)
@@ -1647,9 +2038,14 @@ void HtmlWidget::fill_ellipse(const litehtml::web_color& color, int x, int y, in
     const double ry = height / 2.0;
     const double cx = x + rx;
     const double cy = y + ry;
-    for(int row = y; row < y + height; ++row)
+    const auto clip = active_clip();
+    const int top = std::max(y, to_int(clip.top()));
+    const int bottom = std::min(saturating_add(y, height), to_int(clip.bottom()));
+    const int left = std::max(x, to_int(clip.left()));
+    const int right = std::min(saturating_add(x, width), to_int(clip.right()));
+    for(int row = top; row < bottom; ++row)
     {
-        for(int column = x; column < x + width; ++column)
+        for(int column = left; column < right; ++column)
         {
             const double dx = (column + 0.5 - cx) / rx;
             const double dy = (row + 0.5 - cy) / ry;
@@ -1769,9 +2165,17 @@ std::string HtmlWidget::resource(const char* kind, const std::string& url)
         result.assign(bytes, static_cast<std::size_t>(length));
     } else
     {
-        Tcl_BackgroundException(interp_, code);
+        const std::string message = Tcl_GetStringResult(interp_);
+        Tcl_DecrRefCount(call);
+        Tcl_ResetResult(interp_);
+        throw std::runtime_error(std::string(kind) + " resource callback failed for '" + url + "': " + message);
     }
     Tcl_DecrRefCount(call);
+    if(window_ == nullptr)
+    {
+        Tcl_ResetResult(interp_);
+        throw std::runtime_error("widget was destroyed by a resource callback");
+    }
     Tcl_ResetResult(interp_);
     return result;
 }
@@ -1787,8 +2191,18 @@ Image* HtmlWidget::image_for(const std::string& url)
     Image image;
     image.name = resource("image", url);
     std::error_code filesystem_error;
+    std::size_t file_bytes = 0;
     if(image.name.empty() && std::filesystem::is_regular_file(path_from_utf8(url), filesystem_error))
     {
+        const auto size = std::filesystem::file_size(path_from_utf8(url), filesystem_error);
+        if(!filesystem_error)
+        {
+            if(size > max_document_bytes_ - document_resource_bytes_)
+            {
+                throw std::runtime_error("image resource exceeds the document byte limit");
+            }
+            file_bytes = static_cast<std::size_t>(size);
+        }
         image.name     = internal_image_name("resource", ++image_serial_);
         image.internal = true;
         Tcl_Obj* arguments[6] = {Tcl_NewStringObj("image", -1), Tcl_NewStringObj("create", -1),
@@ -1822,7 +2236,23 @@ Image* HtmlWidget::image_for(const std::string& url)
         return nullptr;
     }
     Tk_SizeOfImage(image.handle, &image.width, &image.height);
+    if(!dimensions_within_limit(image.width, image.height, max_image_pixels_ - image_pixels_))
+    {
+        Tk_FreeImage(image.handle);
+        image.handle = nullptr;
+        delete_internal_image(image);
+        const std::string message = "image '" + url + "' exceeds the " + std::to_string(max_image_pixels_) +
+            " pixel limit";
+        Tcl_SetObjResult(interp_, Tcl_NewStringObj(message.c_str(), -1));
+        throw std::runtime_error(Tcl_GetStringResult(interp_));
+    }
+    image.pixels = static_cast<std::size_t>(image.width) * image.height;
     auto [iterator, inserted] = images_.emplace(url, std::move(image));
+    if(inserted)
+    {
+        image_pixels_ += iterator->second.pixels;
+        document_resource_bytes_ += file_bytes;
+    }
     return inserted ? &iterator->second : nullptr;
 }
 
@@ -1848,7 +2278,13 @@ void HtmlWidget::delete_internal_image(const Image& image)
 
 void HtmlWidget::clear_images()
 {
-    for(const auto& [url, image] : images_)
+    clear_images(images_);
+    image_pixels_ = 0;
+}
+
+void HtmlWidget::clear_images(std::map<std::string, Image>& images)
+{
+    for(const auto& [url, image] : images)
     {
         if(image.handle != nullptr)
         {
@@ -1856,7 +2292,7 @@ void HtmlWidget::clear_images()
         }
         delete_internal_image(image);
     }
-    images_.clear();
+    images.clear();
 }
 
 void HtmlWidget::invoke_link(const std::string& url, const litehtml::element::ptr& element)
@@ -1984,20 +2420,24 @@ void HtmlWidget::draw_text(litehtml::uint_ptr, const char* text, litehtml::uint_
             const int current_bottom = to_int(position.bottom());
             const bool same_line = current_top == previous_top ||
                 (current_top < previous_bottom && previous_top < current_bottom);
-            const int previous_right = to_int(previous.position.x) +
-                Tk_TextWidth(previous.font->tk_font, previous.text.data(), static_cast<int>(previous.text.size()));
+            const int previous_right = saturating_add(
+                to_int(previous.position.x),
+                Tk_TextWidth(previous.font->tk_font, previous.text.data(), static_cast<int>(previous.text.size())));
             if(!same_line)
             {
                 plain_text_ += '\n';
+                ++text_character_count_;
             } else if(to_int(position.x) > previous_right)
             {
                 plain_text_ += ' ';
+                ++text_character_count_;
             }
         }
-        const int first = Tcl_NumUtfChars(plain_text_.data(), static_cast<int>(plain_text_.size()));
+        const int first = text_character_count_;
         const int count = Tcl_NumUtfChars(text, static_cast<int>(std::strlen(text)));
         text_runs_.push_back({{first, first + count}, text, position, font, color});
         plain_text_ += text;
+        text_character_count_ += count;
         return;
     }
     if(color.alpha == 0)
@@ -2007,15 +2447,29 @@ void HtmlWidget::draw_text(litehtml::uint_ptr, const char* text, litehtml::uint_
 
     const int screen_x = to_int(position.x);
     const int screen_y = to_int(position.y);
-    const int doc_x    = screen_x + scroll_x_;
-    const int doc_y    = screen_y + scroll_y_;
-    const auto run = std::find_if(text_runs_.begin(), text_runs_.end(), [&](const TextRun& candidate) {
-        return to_int(candidate.position.x) == doc_x && to_int(candidate.position.y) == doc_y &&
-               candidate.font == font && candidate.text == text;
-    });
-    if(run != text_runs_.end())
+    const int doc_x    = saturating_add(screen_x, scroll_x_);
+    const int doc_y    = saturating_add(screen_y, scroll_y_);
+    if(has_active_highlights())
     {
-        paint_highlights(*run, screen_x, screen_y);
+        const std::pair<int, int> location{doc_x, doc_y};
+        auto candidate = std::lower_bound(
+            text_run_lookup_.begin(), text_run_lookup_.end(), location,
+            [this](std::size_t index, const std::pair<int, int>& value) {
+                return text_run_location(text_runs_[index]) < value;
+            });
+        for(; candidate != text_run_lookup_.end(); ++candidate)
+        {
+            const auto& run = text_runs_[*candidate];
+            if(text_run_location(run) != location)
+            {
+                break;
+            }
+            if(run.font == font && run.text == text)
+            {
+                paint_highlights(run, screen_x, screen_y);
+                break;
+            }
+        }
     }
     paint_text_.push_back({text, font, color, screen_x, screen_y});
 }
@@ -2104,16 +2558,29 @@ void HtmlWidget::draw_image(litehtml::uint_ptr, const litehtml::background_layer
     const int clip_top      = to_int(layer.clip_box.top());
     const int clip_right    = to_int(layer.clip_box.right());
     const int clip_bottom   = to_int(layer.clip_box.bottom());
+    const auto active = active_clip();
+    const int visible_left = std::max(clip_left, to_int(active.left()));
+    const int visible_top = std::max(clip_top, to_int(active.top()));
+    const int visible_right = std::min(clip_right, to_int(active.right()));
+    const int visible_bottom = std::min(clip_bottom, to_int(active.bottom()));
     const auto channel = [&source](const unsigned char* pixel, int component, unsigned char fallback) {
         const int offset = source.offset[component];
         return offset >= 0 && offset < source.pixelSize ? pixel[offset] : fallback;
     };
-    for(int y = std::max(origin_y, clip_top); y < std::min(origin_y + target_height, clip_bottom); ++y)
+    for(int y = std::max(origin_y, visible_top);
+        y < std::min(saturating_add(origin_y, target_height), visible_bottom); ++y)
     {
-        const int source_y = std::clamp((y - origin_y) * source.height / target_height, 0, source.height - 1);
-        for(int x = std::max(origin_x, clip_left); x < std::min(origin_x + target_width, clip_right); ++x)
+        const auto source_y_offset =
+            (static_cast<long long>(y) - origin_y) * source.height / target_height;
+        const int source_y = static_cast<int>(
+            std::clamp(source_y_offset, 0LL, static_cast<long long>(source.height - 1)));
+        for(int x = std::max(origin_x, visible_left);
+            x < std::min(saturating_add(origin_x, target_width), visible_right); ++x)
         {
-            const int source_x = std::clamp((x - origin_x) * source.width / target_width, 0, source.width - 1);
+            const auto source_x_offset =
+                (static_cast<long long>(x) - origin_x) * source.width / target_width;
+            const int source_x = static_cast<int>(
+                std::clamp(source_x_offset, 0LL, static_cast<long long>(source.width - 1)));
             const unsigned char* pixel = source.pixelPtr + source_y * source.pitch + source_x * source.pixelSize;
             const litehtml::web_color color(channel(pixel, Red, 0), channel(pixel, Green, 0),
                                              channel(pixel, Blue, 0),
@@ -2145,7 +2612,15 @@ void HtmlWidget::draw_linear_gradient(litehtml::uint_ptr, const litehtml::backgr
     const auto& last  = gradient.color_points.back().color;
     const bool horizontal = std::abs(gradient.end.x - gradient.start.x) > std::abs(gradient.end.y - gradient.start.y);
     const int length = std::max(horizontal ? to_int(layer.border_box.width) : to_int(layer.border_box.height), 1);
-    for(int offset = 0; offset < length; ++offset)
+    const int origin = horizontal ? to_int(layer.border_box.x) : to_int(layer.border_box.y);
+    const auto clip = active_clip();
+    const int clip_start = horizontal ? to_int(clip.left()) : to_int(clip.top());
+    const int clip_end = horizontal ? to_int(clip.right()) : to_int(clip.bottom());
+    const auto first_distance = static_cast<long long>(clip_start) - origin;
+    const auto last_distance = static_cast<long long>(clip_end) - origin;
+    const int first_offset = static_cast<int>(std::clamp(first_distance, 0LL, static_cast<long long>(length)));
+    const int last_offset = static_cast<int>(std::clamp(last_distance, 0LL, static_cast<long long>(length)));
+    for(int offset = first_offset; offset < last_offset; ++offset)
     {
         const double fraction = length == 1 ? 0.0 : static_cast<double>(offset) / (length - 1);
         const auto mix = [fraction](int from, int to) {
@@ -2153,8 +2628,8 @@ void HtmlWidget::draw_linear_gradient(litehtml::uint_ptr, const litehtml::backgr
         };
         const litehtml::web_color color(mix(first.red, last.red), mix(first.green, last.green),
                                         mix(first.blue, last.blue), mix(first.alpha, last.alpha));
-        const int x = to_int(layer.border_box.x) + (horizontal ? offset : 0);
-        const int y = to_int(layer.border_box.y) + (horizontal ? 0 : offset);
+        const int x = saturating_add(to_int(layer.border_box.x), horizontal ? offset : 0);
+        const int y = saturating_add(to_int(layer.border_box.y), horizontal ? 0 : offset);
         fill_rectangle(color, x, y, horizontal ? 1 : to_int(layer.border_box.width),
                        horizontal ? to_int(layer.border_box.height) : 1);
     }
@@ -2201,8 +2676,8 @@ void HtmlWidget::draw_borders(litehtml::uint_ptr, const litehtml::borders& borde
     const int top    = to_int(borders.top.width);
     const int bottom = to_int(borders.bottom.width);
     draw_border(borders.top, x, y, width, top);
-    draw_border(borders.right, x + width - right, y, right, height);
-    draw_border(borders.bottom, x, y + height - bottom, width, bottom);
+    draw_border(borders.right, saturating_add(x, width - right), y, right, height);
+    draw_border(borders.bottom, x, saturating_add(y, height - bottom), width, bottom);
     draw_border(borders.left, x, y, left, height);
 }
 
@@ -2307,18 +2782,38 @@ void HtmlWidget::import_css(std::string& text, const std::string& url, std::stri
 {
     const std::string resolved = resolve_url(url.c_str(), base.c_str());
     text = resource("stylesheet", resolved);
+    if(text.size() > max_document_bytes_ - document_resource_bytes_)
+    {
+        throw std::runtime_error("stylesheet exceeds the document byte limit");
+    }
     if(text.empty())
     {
-        std::ifstream stream(path_from_utf8(resolved), std::ios::binary);
+        const auto path = path_from_utf8(resolved);
+        std::error_code filesystem_error;
+        if(!std::filesystem::is_regular_file(path, filesystem_error))
+        {
+            return;
+        }
+        const auto size = std::filesystem::file_size(path, filesystem_error);
+        if(!filesystem_error && size > max_document_bytes_ - document_resource_bytes_)
+        {
+            throw std::runtime_error("stylesheet exceeds the document byte limit");
+        }
+        std::ifstream stream(path, std::ios::binary);
         if(stream)
         {
             std::ostringstream contents;
             contents << stream.rdbuf();
             text = contents.str();
+            if(text.size() > max_document_bytes_ - document_resource_bytes_)
+            {
+                throw std::runtime_error("stylesheet exceeds the document byte limit");
+            }
         }
     }
     if(!text.empty())
     {
+        document_resource_bytes_ += text.size();
         base = resolved;
     }
 }
@@ -2380,7 +2875,13 @@ void HtmlWidget::get_language(std::string& language, std::string& culture) const
 
 int widget_factory(ClientData, Tcl_Interp* interp, int objc, Tcl_Obj* const objv[])
 {
-    return HtmlWidget::create(interp, objc, objv);
+    try
+    {
+        return HtmlWidget::create(interp, objc, objv);
+    } catch(...)
+    {
+        return exception_result(interp, "widget creation");
+    }
 }
 } // namespace
 

@@ -108,4 +108,15 @@ if(BUILD_TESTING)
       -packagepath "${CMAKE_CURRENT_BINARY_DIR}"
   )
   set_tests_properties(tklitehtml-tests PROPERTIES SKIP_RETURN_CODE 77)
+  add_test(
+    NAME tklitehtml-performance
+    COMMAND ${TCL_TCLSH}
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/performance.tcl"
+      -packagepath "${CMAKE_CURRENT_BINARY_DIR}"
+  )
+  set_tests_properties(tklitehtml-performance PROPERTIES
+    LABELS Performance
+    SKIP_RETURN_CODE 77
+    TIMEOUT 30
+  )
 endif()
