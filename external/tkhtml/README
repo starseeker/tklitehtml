@@ -1,0 +1,8 @@
+Sources originally from CVS repository at tkhtml.tcl.tk:/tkhtml
+checkout htmlwidget
+
+There have been various mods to Tkhtml by the BRL-CAD project over
+the years - see BRL-CAD's main repository history for details.
+
+The purpose of this widget is to support manual and documentation
+page viewer in MGED and Archer.
