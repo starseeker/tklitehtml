@@ -5,6 +5,9 @@
 /*-build*
 /out
 
+# Ignore local brlcad testing copy
+/brlcad
+
 # Temporary files
 *~
 \#*\#
